@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "KEATS Downloader",
-  "version": "1.4.0",
-  "description": "Download all KEATS course materials in one click. Slides, videos, podcasts — organised into folders.",
+  "name": "KEATS Downloader Custom",
+  "version": "1.5.0",
+  "description": "Select, preview and download KEATS course materials, organised into folders.",
   "permissions": [
     "downloads",
+    "alarms",
     "downloads.ui",
     "activeTab",
     "scripting",

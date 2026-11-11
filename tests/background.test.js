@@ -97,72 +97,38 @@ describe('sleep', () => {
   });
 });
 
-describe('downloadWithRetry', () => {
-  let mockDownloadSingleFile;
 
+describe('prepareWithRetry', () => {
   beforeEach(() => {
-    bg.state = {
-      status: 'idle', courseName: '', totalFiles: 0, downloadedFiles: 0,
-      failedFiles: 0, scannedSections: 0, totalSections: 0, currentFile: '', log: [], errors: [], sections: [], cancelled: false,
-    };
+    bg.state = { ...bg.state, log: [] };
   });
 
-  test('succeeds on first attempt', async () => {
-    // downloadWithRetry calls downloadSingleFile internally via the module
-    // We test the retry wrapper by checking it resolves with the mock chrome
+  test('prepares the file on the first attempt without submitting a download', async () => {
     const file = {
       name: 'test.pdf', href: 'https://example.com/test.pdf',
       type: 'resource', sectionName: 'Week 1', category: 'Lectures',
     };
-
-    // The chrome mock auto-completes downloads
-    await expect(bg.downloadWithRetry(file, 'KEATS Downloads/Course/', 1)).resolves.toBeUndefined();
+    const result = await bg.prepareWithRetry(file, 'KEATS Downloads/Course/', 1);
+    expect(result.fullPath).toBe('KEATS Downloads/Course/Week 1/Lectures/test.pdf');
+    expect(chrome.downloads.download).not.toHaveBeenCalled();
   });
 
-  test('retries on failure and eventually succeeds', async () => {
-    let callCount = 0;
-    // Make download fail twice then succeed
-    global.chrome.downloads.download = jest.fn((opts, cb) => {
-      callCount++;
-      if (callCount < 3) {
-        // Simulate failure
-        global.chrome.runtime.lastError = { message: 'Network error' };
-        cb(undefined);
-        global.chrome.runtime.lastError = null;
-      } else {
-        const id = 100 + callCount;
-        cb(id);
-        setTimeout(() => {
-          // Trigger the onChanged listener for completion
-          const listeners = global.chrome.downloads.onChanged.addListener.mock.calls;
-          const lastListener = listeners[listeners.length - 1]?.[0];
-          if (lastListener) lastListener({ id, state: { current: 'complete' } });
-        }, 10);
-      }
-    });
-
+  test('retries failed file fetches', async () => {
+    global.fetch.mockClear();
+    global.fetch.mockResolvedValueOnce({ ok: false, status: 503 })
+      .mockResolvedValueOnce({ ok: false, status: 502 });
     const file = {
       name: 'retry.pdf', href: 'https://example.com/retry.pdf',
       type: 'folderFile', sectionName: 'Week 1',
     };
-
-    await expect(bg.downloadWithRetry(file, 'KEATS/', 3)).resolves.toBeUndefined();
-    expect(callCount).toBe(3);
+    await expect(bg.prepareWithRetry(file, 'KEATS/', 3)).resolves.toHaveProperty('downloadUrl');
+    expect(fetch).toHaveBeenCalledTimes(3);
   });
 
-  test('throws after all retries exhausted', async () => {
-    global.chrome.downloads.download = jest.fn((opts, cb) => {
-      global.chrome.runtime.lastError = { message: 'Server error' };
-      cb(undefined);
-      global.chrome.runtime.lastError = null;
-    });
-
-    const file = {
-      name: 'fail.mp4', href: 'https://example.com/fail.mp4',
-      type: 'echo360', sectionName: 'Week 1',
-    };
-
-    await expect(bg.downloadWithRetry(file, 'KEATS/', 2)).rejects.toThrow('Server error');
+  test('throws after all retries are exhausted', async () => {
+    global.fetch.mockResolvedValue({ ok: false, status: 503 });
+    const file = { name: 'fail.pdf', href: 'https://example.com/fail.pdf', type: 'resource' };
+    await expect(bg.prepareWithRetry(file, 'KEATS/', 2)).rejects.toThrow('HTTP 503');
   });
 });
 

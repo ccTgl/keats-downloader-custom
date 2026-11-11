@@ -226,15 +226,6 @@ describe('video file handling', () => {
       sections: [], cancelled: false,
     };
 
-    global.chrome.downloads.download = jest.fn((opts, cb) => {
-      const id = Math.floor(Math.random() * 10000);
-      cb(id);
-      setTimeout(() => {
-        const listeners = global.chrome.downloads.onChanged.addListener.mock.calls;
-        const last = listeners[listeners.length - 1]?.[0];
-        if (last) last({ id, state: { current: 'complete' } });
-      }, 10);
-    });
     global.chrome.runtime.lastError = null;
   });
 
@@ -246,16 +237,16 @@ describe('video file handling', () => {
       type: 'echo360', sectionName: 'Recordings',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS/Course/', 1);
+    const opts = await bg.prepareWithRetry(file, 'KEATS/Course/', 1);
 
     // fetch should NOT be called (no blob conversion)
     expect(global.fetch).not.toHaveBeenCalled();
 
     // download URL should be the original echo360 URL
-    const opts = global.chrome.downloads.download.mock.calls[0][0];
-    expect(opts.url).toContain('echo360');
-    expect(opts.filename).toContain('Lecture 1.mp4');
-    expect(opts.saveAs).toBe(false);
+
+    expect(opts.downloadUrl).toContain('echo360');
+    expect(opts.fullPath).toContain('Lecture 1.mp4');
+
   });
 
   test('kaltura files use direct URL, not blob', async () => {
@@ -266,12 +257,12 @@ describe('video file handling', () => {
       type: 'kalturaDownload', sectionName: 'Week 2', category: 'Lectures',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS/Course/', 1);
+    const opts = await bg.prepareWithRetry(file, 'KEATS/Course/', 1);
     expect(global.fetch).not.toHaveBeenCalled();
 
-    const opts = global.chrome.downloads.download.mock.calls[0][0];
-    expect(opts.url).toContain('kaltura');
-    expect(opts.filename).toContain('Week 2 Video.mp4');
+
+    expect(opts.downloadUrl).toContain('kaltura');
+    expect(opts.fullPath).toContain('Week 2 Video.mp4');
   });
 
   test('resource files go through blob path', async () => {
@@ -290,11 +281,11 @@ describe('video file handling', () => {
       type: 'resource', sectionName: 'Week 1',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS/Course/', 1);
+    const opts = await bg.prepareWithRetry(file, 'KEATS/Course/', 1);
     expect(global.fetch).toHaveBeenCalled();
 
-    const opts = global.chrome.downloads.download.mock.calls[0][0];
-    expect(opts.url).toMatch(/^data:/);
+
+    expect(opts.downloadUrl).toMatch(/^data:/);
   });
 
   test('folderFile uses blob path with filename from URL', async () => {
@@ -313,11 +304,11 @@ describe('video file handling', () => {
       type: 'folderFile', sectionName: 'Week 1', category: 'Tutorials',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS/Course/', 1);
+    const opts = await bg.prepareWithRetry(file, 'KEATS/Course/', 1);
     expect(global.fetch).toHaveBeenCalled();
 
-    const opts = global.chrome.downloads.download.mock.calls[0][0];
-    expect(opts.filename).toContain('handout.pdf');
+
+    expect(opts.fullPath).toContain('handout.pdf');
   });
 });
 
@@ -350,60 +341,13 @@ describe('error recovery', () => {
       });
     });
 
-    global.chrome.downloads.download = jest.fn((opts, cb) => {
-      const id = 999;
-      cb(id);
-      setTimeout(() => {
-        const listeners = global.chrome.downloads.onChanged.addListener.mock.calls;
-        const last = listeners[listeners.length - 1]?.[0];
-        if (last) last({ id, state: { current: 'complete' } });
-      }, 10);
-    });
 
     const file = {
       name: 'test.pdf', href: 'https://example.com/test.pdf',
       type: 'resource', sectionName: 'Week 1',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS/', 3);
-    expect(attempt).toBe(2);
-  });
-
-  test('download interrupted triggers retry', async () => {
-    let attempt = 0;
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true, status: 200,
-      url: 'https://example.com/file.pdf',
-      headers: { get: () => null },
-      blob: () => Promise.resolve({
-        arrayBuffer: () => Promise.resolve(new ArrayBuffer(4)),
-        type: 'application/pdf',
-      }),
-    });
-
-    global.chrome.downloads.download = jest.fn((opts, cb) => {
-      attempt++;
-      const id = 1000 + attempt;
-      cb(id);
-      setTimeout(() => {
-        const listeners = global.chrome.downloads.onChanged.addListener.mock.calls;
-        const last = listeners[listeners.length - 1]?.[0];
-        if (last) {
-          if (attempt === 1) {
-            last({ id, state: { current: 'interrupted' }, error: { current: 'NETWORK_FAILED' } });
-          } else {
-            last({ id, state: { current: 'complete' } });
-          }
-        }
-      }, 10);
-    });
-
-    const file = {
-      name: 'test.pdf', href: 'https://example.com/test.pdf',
-      type: 'resource', sectionName: 'Week 1',
-    };
-
-    await bg.downloadWithRetry(file, 'KEATS/', 3);
+    await bg.prepareWithRetry(file, 'KEATS/', 3);
     expect(attempt).toBe(2);
   });
 
@@ -415,7 +359,7 @@ describe('error recovery', () => {
       type: 'resource', sectionName: 'Week 1',
     };
 
-    await expect(bg.downloadWithRetry(file, 'KEATS/', 2)).rejects.toThrow('HTTP 500');
+    await expect(bg.prepareWithRetry(file, 'KEATS/', 2)).rejects.toThrow('HTTP 500');
   });
 });
 

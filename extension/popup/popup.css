@@ -651,3 +651,18 @@ footer {
   background: var(--scrollbar);
   border-radius: 2px;
 }
+
+.week-picker { margin: 12px 0; padding: 8px 10px; border: 1px solid var(--card-border); border-radius: 8px; }
+.week-picker legend { font-size: 12px; font-weight: 600; padding: 0 4px; }
+.week-actions { display: flex; justify-content: space-between; margin-bottom: 4px; }
+.week-list, .preview-files { max-height: 180px; overflow-y: auto; }
+#preview h2 { font-size: 16px; margin-bottom: 5px; }
+#preview-summary { font-size: 12px; margin: 6px 0; }
+.preview-group { font-size: 12px; margin: 8px 0 4px; }
+.preview-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; padding: 4px 0; font-size: 12px; }
+.preview-row > :first-child { min-width: 0; overflow-wrap: anywhere; }
+.preview-duplicate { color: var(--text-secondary); }
+.preview-note { display: block; font-size: 11px; color: var(--text-secondary); }
+#ready-error:empty, #preview-error:empty, #complete-errors:empty { display: none; }
+#ready-error, #preview-error, #complete-errors { font-size: 12px; margin: 6px 0; overflow-wrap: anywhere; }
+#progress-details { font-size: 11px; margin: 4px 0; }

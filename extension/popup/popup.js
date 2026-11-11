@@ -5,6 +5,7 @@ const $ = (sel) => document.querySelector(sel);
 const views = {
   notKeats: $('#not-keats'),
   ready: $('#ready'),
+  preview: $('#preview'),
   progress: $('#progress'),
   complete: $('#complete'),
 };
@@ -97,8 +98,9 @@ async function loadLibrary() {
           <div class="library-item-name">${esc(name)}</div>
           <div class="library-item-meta">${info.count} files · ${dateStr}</div>
         </div>
-        <button class="btn-text btn-clear-course" data-course="${esc(name)}">Clear</button>
+        <button class="btn-text btn-clear-course" >Clear</button>
       `;
+      item.querySelector('.btn-clear-course').dataset.course = name;
       list.appendChild(item);
     }
 
@@ -125,17 +127,7 @@ async function init() {
 
   // Check if we already have an active download
   try {
-    const status = await sendBg({ type: 'GET_STATUS' });
-    if (status && (status.status === 'scanning' || status.status === 'downloading')) {
-      showView('progress');
-      updateProgress(status);
-      return;
-    }
-    if (status && (status.status === 'complete' || status.status === 'cancelled' || status.status === 'error')) {
-      showView('complete');
-      updateComplete(status);
-      return;
-    }
+    if (renderStatus(await sendBg({ type: 'GET_STATUS' }))) return;
   } catch (e) {}
 
   // Check current tab
@@ -216,24 +208,8 @@ async function init() {
     });
 
     const info = results[0]?.result;
-    if (info && info.courseName && info.sections.length > 0) {
-      $('#course-name').textContent = info.courseName;
-      $('#section-count').textContent = info.sections.length;
-      $('#path-course-name').textContent = info.courseName.substring(0, 30);
-      showView('ready');
-      window._courseInfo = info;
-      window._tabId = tab.id;
-    } else if (info && info.courseName) {
-      $('#course-name').textContent = info.courseName;
-      $('#section-count').textContent = '0';
-      $('#path-course-name').textContent = info.courseName.substring(0, 30);
-      showView('ready');
-      window._courseInfo = info;
-      window._courseInfo.sections = [{ href: info.courseUrl, name: info.courseName, inline: false }];
-      window._tabId = tab.id;
-    } else {
-      showView('notKeats');
-    }
+    if (info?.courseName) renderCourse(info, tab.id);
+    else showView('notKeats');
   } catch (e) {
     showView('notKeats');
   }
@@ -257,91 +233,179 @@ async function init() {
   } catch (e) {}
 }
 
-// ---------- Download button ----------
+
+function renderCourse(info, tabId) {
+  const previous = window._courseInfo;
+  const selections = new Map([...$('#week-list').querySelectorAll('input')]
+    .map(input => [input.dataset.sectionKey, input.checked]));
+  if (!info.sections.length) info.sections = [{ href: info.courseUrl, name: info.courseName }];
+  window._courseInfo = info;
+  window._tabId = tabId;
+  $('#course-name').textContent = info.courseName;
+  $('#path-course-name').textContent = info.courseName.substring(0, 30);
+  const list = $('#week-list');
+  list.replaceChildren();
+  for (const [index, section] of info.sections.entries()) {
+    const label = document.createElement('label');
+    label.className = 'checkbox-row';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.value = String(index);
+    input.dataset.sectionKey = section.href;
+    input.checked = previous?.courseUrl === info.courseUrl ? (selections.get(section.href) ?? true) : true;
+    const text = document.createElement('span');
+    text.textContent = section.name;
+    label.append(input, text);
+    list.append(label);
+  }
+  updateSelection();
+  showView('ready');
+}
+
+function updateSelection() {
+  const count = $('#week-list').querySelectorAll('input:checked').length;
+  $('#section-count').textContent = count + ' / ' + (window._courseInfo?.sections.length || 0);
+  $('#btn-download').disabled = count === 0;
+  $('#ready-error').textContent = '';
+}
+
+$('#week-list').addEventListener('change', updateSelection);
+for (const [selector, checked] of [['#btn-select-all', true], ['#btn-select-none', false]]) {
+  $(selector).addEventListener('click', () => {
+    for (const input of $('#week-list').querySelectorAll('input')) input.checked = checked;
+    updateSelection();
+  });
+}
 
 $('#btn-download').addEventListener('click', async () => {
-  const btn = $('#btn-download');
-  btn.disabled = true;
-  btn.textContent = 'Starting...';
-  showView('progress');
-
+  const sections = [...$('#week-list').querySelectorAll('input:checked')]
+    .map(input => window._courseInfo.sections[Number(input.value)]);
+  if (!sections.length) return;
+  $('#btn-download').disabled = true;
+  $('#ready-error').textContent = '';
   const downloadPath = $('#download-path').value.trim() || 'KEATS Downloads';
-  chrome.storage.local.set({ downloadPath });
-
-  await sendBg({
-    type: 'START_DOWNLOAD',
-    tabId: window._tabId,
-    courseInfo: window._courseInfo,
-    options: {
-      materials: $('#opt-materials').checked,
-      videos: $('#opt-videos').checked,
-      captures: $('#opt-captures').checked,
-      folders: $('#opt-folders').checked,
-      optional: $('#opt-optional').checked,
-      downloadPath,
-    },
-  });
-});
-
-// ---------- Cancel button ----------
-
-$('#btn-cancel').addEventListener('click', async () => {
-  try { await sendBg({ type: 'CANCEL' }); } catch (e) {}
-  showView('ready');
-  const btn = $('#btn-download');
-  btn.disabled = false;
-  btn.innerHTML = `
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-      <polyline points="7 10 12 15 17 10"/>
-      <line x1="12" y1="15" x2="12" y2="3"/>
-    </svg>
-    Download All
-  `;
-  $('#btn-cancel').textContent = 'Cancel';
-  $('#btn-cancel').disabled = false;
-  loadLibrary();
-});
-
-// ---------- Done button ----------
-
-$('#btn-done').addEventListener('click', () => {
-  sendBg({ type: 'CANCEL' });
-  showView('ready');
-  const btn = $('#btn-download');
-  btn.disabled = false;
-  btn.innerHTML = `
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-      <polyline points="7 10 12 15 17 10"/>
-      <line x1="12" y1="15" x2="12" y2="3"/>
-    </svg>
-    Download All
-  `;
-  $('#btn-cancel').textContent = 'Cancel';
-  $('#btn-cancel').disabled = false;
-  loadLibrary();
-});
-
-// ---------- Progress updates (push-based, no polling) ----------
-
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'PROGRESS_UPDATE') {
-    const s = msg.state;
-    if (s.status === 'scanning' || s.status === 'downloading') {
-      showView('progress');
-      updateProgress(s);
-    } else if (s.status === 'complete' || s.status === 'cancelled' || s.status === 'error') {
-      showView('complete');
-      updateComplete(s);
-    }
+  try {
+    await chrome.storage.local.set({ downloadPath });
+    const reply = await sendBg({
+      type: 'SCAN_COURSE',
+      tabId: window._tabId,
+      courseInfo: { ...window._courseInfo, sections },
+      options: {
+        materials: $('#opt-materials').checked,
+        videos: $('#opt-videos').checked,
+        captures: $('#opt-captures').checked,
+        folders: $('#opt-folders').checked,
+        optional: $('#opt-optional').checked,
+        downloadPath,
+      },
+    });
+    if (!reply?.ok) throw new Error(reply?.error || 'Could not start the scan.');
+    renderStatus(await sendBg({ type: 'GET_STATUS' }));
+  } catch (error) {
+    $('#ready-error').textContent = error.message;
+    $('#btn-download').disabled = false;
   }
 });
+
+$('#btn-confirm').addEventListener('click', async () => {
+  $('#btn-confirm').disabled = true;
+  $('#preview-error').textContent = '';
+  try {
+    const reply = await sendBg({ type: 'CONFIRM_DOWNLOAD', jobId: displayedJobId });
+    if (!reply?.ok) throw new Error(reply?.error || 'Could not confirm the preview.');
+    renderStatus(await sendBg({ type: 'GET_STATUS' }));
+  } catch (error) {
+    try { renderStatus(await sendBg({ type: 'GET_STATUS' })); } catch {}
+    $('#preview-error').textContent = error.message;
+  }
+});
+
+async function leaveJob() {
+  try {
+    const result = await sendBg({ type: 'CANCEL', jobId: displayedJobId });
+    if (result?.ok && !renderStatus(await sendBg({ type: 'GET_STATUS' }))) await init();
+  } catch {
+    // The next status update or popup reopen will restore the current job.
+  }
+}
+
+for (const selector of ['#btn-cancel', '#btn-back', '#btn-done']) {
+  $(selector).addEventListener('click', leaveJob);
+}
+
+let displayedJobId;
+let progressPoll;
+function renderStatus(s) {
+  displayedJobId = s?.jobId;
+  clearInterval(progressPoll);
+  if (s?.status === 'scanning' || s?.status === 'downloading') {
+    showView('progress');
+    updateProgress(s);
+    if (s.status === 'downloading') {
+      progressPoll = setInterval(async () => {
+        try { renderStatus(await sendBg({ type: 'GET_STATUS' })); } catch {}
+      }, 1000);
+    }
+    return true;
+  }
+  if (s?.status === 'preview') {
+    showView('preview');
+    updatePreview(s);
+    return true;
+  }
+  if (['complete', 'cancelled', 'error'].includes(s?.status)) {
+    showView('complete');
+    updateComplete(s);
+    return true;
+  }
+  return false;
+}
+
+chrome.runtime.onMessage.addListener(msg => {
+  if (msg.type === 'PROGRESS_UPDATE') renderStatus(msg.state);
+});
+
+function updatePreview(s) {
+  const rows = s.items || [];
+  $('#preview-course').textContent = s.courseName;
+  $('#preview-summary').textContent = s.totalFiles + ' ready · ' + s.skippedFiles +
+    ' duplicates skipped' + (s.errors.length ? ' · ' + s.errors.length + ' scan issues' : '');
+  $('#preview-path').textContent = 'Downloads/' + s.basePath;
+  $('#btn-confirm').disabled = !s.totalFiles;
+  $('#preview-error').textContent = s.errors.map(error => error.name + ' – ' + error.error).join(' · ');
+  const list = $('#preview-files');
+  list.replaceChildren();
+  let section;
+  for (const file of rows) {
+    if (file.sectionName !== section) {
+      section = file.sectionName;
+      const heading = document.createElement('h3');
+      heading.className = 'preview-group';
+      heading.textContent = section || 'Course files';
+      list.append(heading);
+    }
+    const row = document.createElement('div');
+    row.className = 'preview-row';
+    const name = document.createElement('span');
+    name.textContent = file.name;
+    const detail = document.createElement('small');
+    detail.className = 'preview-note';
+    detail.textContent = [file.category !== 'other' ? file.category : '', file.folderName, file.typeLabel].filter(Boolean).join(' / ');
+    name.append(detail);
+    const status = document.createElement('span');
+    status.textContent = file.reason || 'Ready';
+    if (file.reason) status.className = 'preview-duplicate';
+    row.append(name, status);
+    list.append(row);
+  }
+  if (!rows.length) list.textContent = 'No downloadable resources were found in the selected sections.';
+}
 
 function updateProgress(s) {
   const statusBadge = $('#progress-status');
   const progressBar = $('#progress-bar');
   const progressCount = $('#progress-count');
+  const details = $('#progress-details');
 
   if (s.status === 'scanning') {
     statusBadge.textContent = 'Scanning';
@@ -352,14 +416,20 @@ function updateProgress(s) {
     progressBar.style.width = scanPct + '%';
     progressCount.textContent = s.totalSections > 0
       ? `${s.scannedSections} / ${s.totalSections} sections` : '';
+    details.textContent = s.cancelled ? 'Stopping scan…' : '';
   } else {
     progressBar.classList.remove('scanning');
     statusBadge.textContent = 'Downloading';
     statusBadge.className = 'status-badge downloading';
-    const pct = s.totalFiles > 0
-      ? Math.round((s.downloadedFiles + s.failedFiles) / s.totalFiles * 100) : 0;
+    const pct = s.totalFiles > 0 ? Math.round(s.processedFiles / s.totalFiles * 100) : 0;
     progressBar.style.width = pct + '%';
-    progressCount.textContent = `${s.downloadedFiles + s.failedFiles} / ${s.totalFiles}`;
+    progressCount.textContent = s.processedFiles + ' / ' + s.totalFiles + ' processed';
+    const transfers = (s.items || []).filter(item => item.status === 'in_progress' && item.totalBytes > 0);
+    const sizes = transfers.map(item => Math.min(100, Math.round((item.bytesReceived || 0) * 100 / item.totalBytes)) + '%');
+    details.textContent = s.cancelled ? 'Cancelling…' : [
+      s.downloadedFiles + ' completed', s.activeFiles + ' active', s.failedFiles + ' failed',
+      ...(sizes.length ? ['Chrome transfers ' + sizes.join(', ')] : []),
+    ].join(' · ');
   }
 
   $('#current-file').textContent = s.currentFile || '';
@@ -386,9 +456,11 @@ function updateComplete(s) {
   $('#stat-downloaded').textContent = s.downloadedFiles;
   $('#stat-failed').textContent = s.failedFiles;
   $('#stat-failed').parentElement.style.display = s.failedFiles > 0 ? 'flex' : 'none';
+  $('#stat-skipped').textContent = s.skippedFiles;
+  $('#stat-skipped').parentElement.style.display = s.skippedFiles > 0 ? 'flex' : 'none';
 
-  const path = $('#download-path')?.value || 'KEATS Downloads';
-  $('#save-path').innerHTML = `Saved to <strong>Downloads/${esc(path)}/</strong>`;
+  $('#save-path').textContent = s.basePath ? 'Destination: Downloads/' + s.basePath : '';
+  $('#complete-errors').textContent = (s.errors || []).map(error => error.name + ' – ' + error.error).join(' · ');
 }
 
 // ---------- Helpers ----------

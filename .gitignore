@@ -6,3 +6,37 @@ selenium/
 *.db
 node_modules/
 .claude/
+
+# Local credentials and browser data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+cookies*.json
+storage-state*.json
+chrome-profile*/
+chrome-user-data/
+*.log
+*.sqlite*
+Thumbs.db
+Desktop.ini
+
+# Downloads and local release artifacts
+downloads/
+KEATS Downloads/
+dist/
+*.pdf
+*.ppt
+*.pptx
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.zip
+*.7z
+*.crx
+/PHASE-1.md
+/PHASE-2.md

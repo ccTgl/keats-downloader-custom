@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>KEATS Downloader</title>
+  <title>KEATS Downloader Custom</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -11,8 +11,8 @@
     <header>
       <img src="../icons/logo.png" alt="" class="logo">
       <div class="header-text">
-        <h1>KEATS Downloader</h1>
-        <span class="subtitle">Download course materials in one click</span>
+        <h1>KEATS Downloader Custom</h1>
+        <span class="subtitle">Select, preview, and download course materials</span>
       </div>
       <label class="toggle" title="Toggle dark mode">
         <input type="checkbox" id="theme-toggle">
@@ -59,6 +59,17 @@
         <p id="new-files-badge" class="new-files-badge hidden"></p>
       </div>
 
+      <fieldset class="week-picker">
+        <legend>Weeks and sections</legend>
+        <div class="week-actions">
+          <button id="btn-select-all" class="btn-text" type="button">Select all</button>
+          <button id="btn-select-none" class="btn-text" type="button">Clear selection</button>
+        </div>
+        <div id="week-list" class="week-list"></div>
+      </fieldset>
+
+      <p id="ready-error" class="log-error" role="alert"></p>
+
       <div class="options">
         <h3>Download Options</h3>
         <label class="checkbox-row">
@@ -71,7 +82,7 @@
         </label>
         <label class="checkbox-row">
           <input type="checkbox" id="opt-captures">
-          <span>Lecture capture recordings (Echo360)</span>
+          <span>Course-wide lecture captures (Echo360)</span>
         </label>
         <label class="checkbox-row">
           <input type="checkbox" id="opt-folders" checked>
@@ -102,9 +113,21 @@
           <polyline points="7 10 12 15 17 10"/>
           <line x1="12" y1="15" x2="12" y2="3"/>
         </svg>
-        Download All
+        Scan and Preview
       </button>
     </div>
+
+    <div id="preview" class="card hidden">
+      <h2>Download Preview</h2>
+      <p id="preview-course" class="course-name"></p>
+      <p id="preview-summary" aria-live="polite"></p>
+      <div id="preview-files" class="preview-files"></div>
+      <p id="preview-path" class="save-path"></p>
+      <p id="preview-error" class="log-error" role="alert"></p>
+      <button id="btn-confirm" class="btn-primary">Confirm Download</button>
+      <button id="btn-back" class="btn-secondary">Back to selection</button>
+    </div>
+
 
     <!-- Progress -->
     <div id="progress" class="card hidden">
@@ -115,6 +138,7 @@
       <div class="progress-bar-container">
         <div id="progress-bar" class="progress-bar" style="width: 0%"></div>
       </div>
+      <p id="progress-details" aria-live="polite"></p>
       <p id="current-file" class="current-file"></p>
       <div id="log-container" class="log-container">
         <div id="log" class="log"></div>
@@ -140,8 +164,13 @@
           <span class="stat-value stat-error" id="stat-failed">0</span>
           <span class="stat-label">Failed</span>
         </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-skipped">0</span>
+          <span class="stat-label">Duplicates skipped</span>
+        </div>
       </div>
       <p id="save-path" class="save-path">Saved to <strong>Downloads/KEATS Downloads/</strong></p>
+      <div id="complete-errors" class="log-error"></div>
       <button id="btn-done" class="btn-primary">Done</button>
     </div>
 
@@ -152,7 +181,7 @@
         </svg>
         Saif-AD
       </a>
-      <span class="version">v1.4.0</span>
+      <span class="version">v1.5.0</span>
     </footer>
   </div>
 

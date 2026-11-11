@@ -172,7 +172,7 @@ describe('scraping with complex DOM structures', () => {
   // Skip DOM tests here, they're in scraping.test.js
 });
 
-describe('downloadWithRetry with blob flow', () => {
+describe('prepareWithRetry with blob flow', () => {
   beforeEach(() => {
     bg.state = {
       status: 'downloading', courseName: 'Test', totalFiles: 1,
@@ -182,15 +182,6 @@ describe('downloadWithRetry with blob flow', () => {
     };
 
     // Reset download mock to auto-complete
-    global.chrome.downloads.download = jest.fn((opts, cb) => {
-      const id = Math.floor(Math.random() * 10000);
-      cb(id);
-      setTimeout(() => {
-        const listeners = global.chrome.downloads.onChanged.addListener.mock.calls;
-        const lastListener = listeners[listeners.length - 1]?.[0];
-        if (lastListener) lastListener({ id, state: { current: 'complete' } });
-      }, 10);
-    });
     global.chrome.runtime.lastError = null;
 
     // Mock fetch for blob downloads
@@ -216,7 +207,7 @@ describe('downloadWithRetry with blob flow', () => {
       type: 'resource', sectionName: 'Week 1', category: 'Lectures',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS Downloads/MDE/', 1);
+    await bg.prepareWithRetry(file, 'KEATS Downloads/MDE/', 1);
     // fetch should be called for the blob download
     expect(global.fetch).toHaveBeenCalled();
     const fetchUrl = global.fetch.mock.calls[0][0];
@@ -229,7 +220,7 @@ describe('downloadWithRetry with blob flow', () => {
       type: 'folderFile', sectionName: 'Week 1',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS Downloads/MDE/', 1);
+    await bg.prepareWithRetry(file, 'KEATS Downloads/MDE/', 1);
     expect(global.fetch).toHaveBeenCalled();
   });
 
@@ -239,12 +230,12 @@ describe('downloadWithRetry with blob flow', () => {
       type: 'echo360', sectionName: 'Recordings',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS Downloads/MDE/', 1);
+    const prepared = await bg.prepareWithRetry(file, 'KEATS Downloads/MDE/', 1);
     // fetch should NOT be called for video files
     expect(global.fetch).not.toHaveBeenCalled();
     // download should use the direct URL
-    const downloadOpts = global.chrome.downloads.download.mock.calls[0][0];
-    expect(downloadOpts.url).toContain('echo360');
+
+    expect(prepared.downloadUrl).toContain('echo360');
   });
 
   test('kaltura videos use direct URL (no blob)', async () => {
@@ -253,24 +244,24 @@ describe('downloadWithRetry with blob flow', () => {
       type: 'kalturaDownload', sectionName: 'Week 1',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS Downloads/MDE/', 1);
+    const prepared = await bg.prepareWithRetry(file, 'KEATS Downloads/MDE/', 1);
     expect(global.fetch).not.toHaveBeenCalled();
-    const downloadOpts = global.chrome.downloads.download.mock.calls[0][0];
-    expect(downloadOpts.url).toContain('kaltura');
+
+    expect(prepared.downloadUrl).toContain('kaltura');
   });
 
-  test('data URL is passed to chrome.downloads.download for resources', async () => {
+  test('prepares a data URL for resource downloads', async () => {
     const file = {
       name: 'Test File', href: 'https://keats.kcl.ac.uk/mod/resource/view.php?id=1',
       type: 'resource', sectionName: 'Week 1',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS Downloads/Test/', 1);
-    const downloadOpts = global.chrome.downloads.download.mock.calls[0][0];
+    const prepared = await bg.prepareWithRetry(file, 'KEATS Downloads/Test/', 1);
+
     // Should be a data URL, not the original URL
-    expect(downloadOpts.url).toMatch(/^data:/);
-    expect(downloadOpts.saveAs).toBe(false);
-    expect(downloadOpts.filename).toContain('KEATS Downloads/Test/');
+    expect(prepared.downloadUrl).toMatch(/^data:/);
+
+    expect(prepared.fullPath).toContain('KEATS Downloads/Test/');
   });
 
   test('fetch failure triggers retry', async () => {
@@ -296,7 +287,7 @@ describe('downloadWithRetry with blob flow', () => {
       type: 'resource', sectionName: 'Week 1',
     };
 
-    await bg.downloadWithRetry(file, 'KEATS/', 3);
+    await bg.prepareWithRetry(file, 'KEATS/', 3);
     expect(callCount).toBe(2); // failed once, succeeded on retry
   });
 });

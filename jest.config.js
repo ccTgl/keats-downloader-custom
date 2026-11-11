@@ -8,7 +8,7 @@ module.exports = {
     },
     {
       displayName: 'jsdom',
-      testMatch: ['<rootDir>/tests/scraping.test.js', '<rootDir>/tests/popup.test.js', '<rootDir>/tests/real-pages.test.js'],
+      testMatch: ['<rootDir>/tests/scraping.test.js', '<rootDir>/tests/popup.test.js', '<rootDir>/tests/real-pages.test.js', '<rootDir>/tests/nested-pages.test.js'],
       testEnvironment: 'jsdom',
     },
   ],

@@ -2,20 +2,7 @@
 // Supports any Moodle-based LMS (KEATS, Moodle, etc.) + Echo360 lecture recordings
 
 
-let state = {
-  status: 'idle', // idle | scanning | downloading | complete | error | cancelled
-  courseName: '',
-  totalFiles: 0,
-  downloadedFiles: 0,
-  failedFiles: 0,
-  scannedSections: 0,
-  totalSections: 0,
-  currentFile: '',
-  log: [],
-  errors: [],
-  sections: [],
-  cancelled: false,
-};
+let state = emptyState();
 
 // ==================== New file detection ====================
 
@@ -62,11 +49,11 @@ function scrapeFileHrefsLightweight() {
 
   for (const sel of selectors) {
     for (const link of document.querySelectorAll(sel)) {
-      hrefs.add(link.href.split('#')[0].split('?')[0]);
+      hrefs.add(link.href);
     }
   }
 
-  return { courseName, hrefs: [...hrefs] };
+  return { courseName, courseUrl: location.href, hrefs: [...hrefs] };
 }
 
 async function checkForNewFiles(tabId) {
@@ -84,30 +71,12 @@ async function checkForNewFiles(tabId) {
   const history = await getDownloadHistory();
   const courseName = sanitize(data.courseName).substring(0, 80);
 
-  // Build set of known hrefs for this course
-  const knownHrefs = new Set();
-  for (const [key, entry] of Object.entries(history)) {
-    if (entry.course === courseName) {
-      const parts = key.split('|');
-      if (parts.length >= 4) {
-        const href = parts.slice(3).join('|').split('#')[0].split('?')[0];
-        knownHrefs.add(href);
-      }
-    }
-  }
-
-  // If no history for this course, don't show badge (first time)
-  if (knownHrefs.size === 0) {
-    chrome.action.setBadgeText({ text: '', tabId });
-    return;
-  }
-
-  // Count new files
-  let newCount = 0;
-  for (const href of data.hrefs) {
-    const norm = href.split('#')[0].split('?')[0];
-    if (!knownHrefs.has(norm)) newCount++;
-  }
+  const known = await historyIdentities(history, courseName, courseIdentity(data.courseUrl));
+  // Folder and media containers can only be compared after a full scan.
+  const links = data.hrefs.filter(href => MOODLE_RESOURCE.test(parsePageUrl(href)?.pathname || ''));
+  const identities = new Set((await Promise.all(links.map(href => resourceIdentity(href)))).filter(Boolean));
+  const newCount = [...identities].some(identity => known.has(identity))
+    ? [...identities].filter(identity => !known.has(identity)).length : 0;
 
   if (newCount > 0) {
     chrome.action.setBadgeBackgroundColor({ color: '#c1002a', tabId });
@@ -135,85 +104,490 @@ async function saveDownloadHistory(history) {
 
 function fileKey(courseName, file) {
   // Unique key: course + section + category + filename href
+  if (file.type === 'pageFile') {
+    const link = pageLinkKey(file.href, true);
+    return link ? `${courseName}|||page:${link}` : null;
+  }
   return `${courseName}|${file.sectionName || ''}|${file.category || ''}|${file.href}`;
 }
 
-async function markDownloaded(courseName, file, downloadPath) {
+// ---------- Preview and durable download job ----------
+
+const JOB_STORAGE = 'phase2Job';
+const DOWNLOAD_ALARM = 'phase2Downloads';
+const DOWNLOAD_SLOTS = 3;
+let jobLoaded = false;
+let jobLock = Promise.resolve();
+let knownIdentities;
+
+function emptyState() {
+  return {
+    status: 'idle', courseName: '', totalFiles: 0, downloadedFiles: 0, failedFiles: 0, skippedFiles: 0,
+    scannedSections: 0, totalSections: 0, currentFile: '', log: [], errors: [], sections: [],
+    cancelled: false, items: [],
+  };
+}
+
+function withJobLock(action) {
+  const result = jobLock.then(action);
+  jobLock = result.catch(() => {});
+  return result;
+}
+
+async function loadJob() {
+  if (jobLoaded) return;
+  const stored = (await chrome.storage.session.get(JOB_STORAGE))[JOB_STORAGE];
+  jobLoaded = true;
+  if (!stored) return;
+  state = stored;
+  if (state.status === 'scanning') {
+    if (Number.isInteger(state.scanTabId)) await chrome.tabs.remove(state.scanTabId).catch(() => {});
+    delete state.scanTabId;
+    state.status = state.cancelled ? 'cancelled' : 'error';
+    state.errors.push({ name: 'Scan', error: 'The scan stopped before preview. Start a new scan.' });
+    await persistJob();
+  } else if (state.status === 'downloading') {
+    // Preparation can be repeated. A possible Chrome submission must be reconciled first.
+    for (const item of state.items) {
+      if (item.status === 'preparing') item.status = 'queued';
+    }
+  } else if (state.status === 'preview') {
+    let changed = false;
+    for (const item of state.items) {
+      if (!item.eligible || item.href) continue;
+      item.status = 'unavailable';
+      item.eligible = false;
+      item.reason = 'Temporary link expired. Scan again to refresh it.';
+      state.errors.push({ name: item.name, error: item.reason });
+      changed = true;
+    }
+    if (changed) {
+      state.jobId = crypto.randomUUID();
+      state.totalFiles = state.items.filter(item => item.eligible).length;
+      await persistJob();
+    }
+  }
+}
+
+function safeStoredUrl(href) {
+  const url = parsePageUrl(href);
+  if (!url || url.protocol !== 'https:' || url.username || url.password ||
+      /\/(?:ks|token|access_token)\//i.test(url.pathname)) return null;
+  for (const [key, value] of url.searchParams) {
+    if (/^(?:id|p|section|redirect|forceview|inpopup|forcedownload)$/.test(key) && /^\d+$/.test(value)) continue;
+    if (key === 'file' && MOODLE_FILE.test(url.pathname) && value.startsWith('/')) continue;
+    return null;
+  }
+  url.hash = '';
+  return url.href;
+}
+
+function persistJob() {
+  const items = state.items.map(item => {
+    const { href, ...file } = item;
+    // Video and signed URLs may contain access tokens. Keep those in worker memory.
+    const storedHref = safeStoredUrl(href);
+    return storedHref && ['queued', 'preparing', 'waiting', 'submitting', 'in_progress'].includes(item.status)
+      ? { ...file, href: storedHref } : file;
+  });
+  return chrome.storage.session.set({ [JOB_STORAGE]: { ...state, items } });
+}
+
+function publicState() {
+  const { items = [], courseKey, scanTabId, ...summary } = state;
+  const rows = items.map(item => ({
+    name: item.name, sectionName: item.sectionName, category: item.category, folderName: item.folderName,
+    typeLabel: { resource: 'File', pageFile: 'Moodle Page file', folderFile: 'Folder file',
+      kalturaDownload: 'Kaltura', echo360: 'Echo360' }[item.type],
+    status: item.status, reason: item.reason, error: item.error, bytesReceived: item.bytesReceived,
+    totalBytes: item.totalBytes, downloadId: item.downloadId,
+  }));
+  return { ...summary, items: rows };
+}
+
+async function fingerprint(value) {
+  const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function resourceIdentity(href, resourceId) {
+  if (resourceId) return resourceId;
+  const url = parsePageUrl(pageLinkKey(href));
+  if (!url) return null;
+  const entry = url.pathname.match(/\/entryId\/([^/]+)/i);
+  if (entry && /(?:^|\.)kaltura\.com$/i.test(url.hostname)) {
+    const partner = url.pathname.match(/\/p\/(\d+)/);
+    if (partner) return 'kaltura:' + partner[1] + ':' + entry[1];
+  }
+  for (const key of [...url.searchParams.keys()]) {
+    if (/^(?:access_?token|token|sesskey|signature|policy|key-pair-id|expires|x-amz-.+)$/i.test(key)) {
+      url.searchParams.delete(key);
+    }
+  }
+  return safeStoredUrl(url.href) ? 'url:' + url.href : 'sha256:' + await fingerprint(url.href);
+}
+
+function courseIdentity(href) {
+  const url = parsePageUrl(href);
+  if (!url || url.protocol !== 'https:' || url.username || url.password) return null;
+  const id = url.searchParams.get('id');
+  return url.origin + url.pathname + (/^\d+$/.test(id || '') ? '?id=' + id : '');
+}
+
+async function historyIdentities(history, courseName, courseKey) {
+  const identities = new Set();
+  for (const [key, record] of Object.entries(history)) {
+    if (record.courseKey) {
+      if (record.courseKey === courseKey) for (const identity of record.identities || []) identities.add(identity);
+      continue;
+    }
+    if (record.course !== courseName) continue;
+    const href = key.split('|').slice(3).join('|').replace(/^page:/, '');
+    const identity = await resourceIdentity(href);
+    if (identity) identities.add(identity);
+  }
+  return identities;
+}
+
+async function rememberDownload(item, download) {
   const history = await getDownloadHistory();
-  history[fileKey(courseName, file)] = {
-    name: file.name,
-    path: downloadPath,
-    date: Date.now(),
-    course: courseName,
+  const identities = [...new Set([item.identity, item.resolvedIdentity].filter(Boolean))];
+  history['v2|' + state.courseKey + '|' + item.identity] = {
+    name: item.name, path: download.filename || item.fullPath, date: Date.now(),
+    course: state.courseName, courseKey: state.courseKey, identities, downloadId: download.id,
   };
   await saveDownloadHistory(history);
+  if (knownIdentities) for (const identity of identities) knownIdentities.add(identity);
 }
 
-async function isAlreadyDownloaded(courseName, file) {
+function recountJob() {
+  state.downloadedFiles = state.items.filter(item => item.status === 'complete').length;
+  state.failedFiles = state.items.filter(item => item.status === 'failed').length;
+  state.skippedFiles = state.items.filter(item => item.status === 'duplicate').length;
+  state.processedFiles = state.items.filter(item => item.eligible &&
+    ['complete', 'failed', 'duplicate', 'cancelled'].includes(item.status)).length;
+  const active = state.items.filter(item => ['preparing', 'submitting', 'in_progress'].includes(item.status));
+  state.activeFiles = active.length;
+  state.currentFile = active[0]?.name || '';
+}
+
+async function checkpoint() {
+  recountJob();
+  await persistJob();
+  broadcastProgress();
+}
+
+async function beginScan(tabId, courseInfo, options = {}) {
+  return withJobLock(async () => {
+    await loadJob();
+    if (['scanning', 'preview', 'downloading'].includes(state.status)) {
+      return { ok: false, error: 'Finish or discard the current job first.' };
+    }
+    const courseKey = courseIdentity(courseInfo?.courseUrl);
+    if (!courseKey || !Number.isInteger(tabId) || !Array.isArray(courseInfo.sections) || !courseInfo.sections.length) {
+      return { ok: false, error: 'Choose at least one section from an HTTPS course page.' };
+    }
+    const origin = new URL(courseKey).origin;
+    if (courseInfo.sections.some(section => parsePageUrl(section.href)?.origin !== origin)) {
+      return { ok: false, error: 'Selected sections must belong to the course site.' };
+    }
+    const courseName = sanitize(courseInfo.courseName || 'Unknown').substring(0, 80) || 'Course';
+    const folder = sanitize(options.downloadPath || 'KEATS Downloads') || 'KEATS Downloads';
+    state = { ...emptyState(), status: 'scanning', jobId: crypto.randomUUID(), courseName, courseKey,
+      basePath: folder + '/' + courseName + '/', totalSections: courseInfo.sections.length };
+    knownIdentities = undefined;
+    await checkpoint();
+    void buildPreview(tabId, courseInfo, options);
+    return { ok: true, jobId: state.jobId };
+  });
+}
+
+async function buildPreview(tabId, courseInfo, options) {
+  try {
+    const files = await scanCourse(tabId, courseInfo, options);
+    await withJobLock(async () => {
+      if (state.cancelled) {
+        state.status = 'cancelled';
+      } else {
+        const history = await getDownloadHistory();
+        knownIdentities = await historyIdentities(history, state.courseName, state.courseKey);
+        const candidates = await Promise.all(files.map(async file =>
+          ({ ...file, identity: await resourceIdentity(file.href, file.resourceId) })));
+        const first = new Map();
+        for (const file of candidates) {
+          const previous = first.get(file.identity);
+          if (!previous || (previous.type === 'pageFile' && file.type !== 'pageFile')) first.set(file.identity, file);
+        }
+        for (const file of candidates) {
+          if (!file.identity || !parsePageUrl(file.href)) {
+            const reason = 'File link unavailable';
+            state.items.push({ ...file, status: 'unavailable', reason });
+            state.errors.push({ name: file.name, error: reason });
+            continue;
+          }
+          const reason = (knownIdentities.has(file.identity) || history[fileKey(state.courseName, file)]) ? 'Already downloaded' :
+            first.get(file.identity) !== file ? 'Duplicate in this scan' : '';
+          state.items.push({ ...file, status: reason ? 'duplicate' : 'queued', reason, eligible: !reason });
+        }
+        state.totalFiles = state.items.filter(item => item.eligible).length;
+        state.status = 'preview';
+      }
+      await checkpoint();
+    });
+  } catch {
+    await withJobLock(async () => {
+      state.status = state.cancelled ? 'cancelled' : 'error';
+      if (!state.cancelled) state.errors.push({ name: 'Scan', error: 'The course scan failed. Check the course page and try again.' });
+      await checkpoint();
+    }).catch(reportJobFailure);
+  }
+}
+
+async function confirmDownload(jobId) {
+  const reply = await withJobLock(async () => {
+    await loadJob();
+    if (state.status !== 'preview' || state.jobId !== jobId || !state.totalFiles) {
+      return { ok: false, error: 'There is no matching preview with files to download.' };
+    }
+    await chrome.alarms.create(DOWNLOAD_ALARM, { periodInMinutes: 1 });
+    state.status = 'downloading';
+    try {
+      await checkpoint();
+    } catch (error) {
+      state.status = 'preview';
+      await chrome.alarms.clear(DOWNLOAD_ALARM).catch(() => {});
+      throw error;
+    }
+    return { ok: true };
+  });
+  if (reply.ok) wakeJob();
+  return reply;
+}
+
+async function cancelJob(jobId) {
+  const reply = await withJobLock(async () => {
+    await loadJob();
+    if (state.jobId !== jobId) return { ok: false };
+    if (['scanning', 'downloading'].includes(state.status)) state.cancelled = true;
+    else {
+      state = emptyState();
+      knownIdentities = undefined;
+    }
+    await checkpoint();
+    return { ok: true };
+  });
+  if (reply.ok) wakeJob();
+  return reply;
+}
+
+function failItem(item, message) {
+  item.status = 'failed';
+  item.error = message;
+  state.errors.push({ name: item.name, error: message });
+  addLog('Failed: ' + item.name + ' - ' + message);
+}
+
+async function reconcileSubmission(item) {
+  const recent = await chrome.downloads.search({
+    startedAfter: new Date(item.startedAt - 1).toISOString(), limit: 30,
+  });
+  const assigned = new Set(state.items.map(file => file.downloadId));
+  const candidates = [];
+  for (const download of recent) {
+    if (download.byExtensionId === chrome.runtime.id && !assigned.has(download.id) && download.url &&
+        await fingerprint(download.url) === item.submissionHash) candidates.push(download);
+  }
+  if (candidates.length === 1) {
+    item.downloadId = candidates[0].id;
+    item.status = 'in_progress';
+  } else {
+    failItem(item, 'Chrome did not return a recoverable download ID. Check Chrome Downloads before retrying.');
+  }
+}
+
+async function reconcileDownload(item) {
+  const [download] = await chrome.downloads.search({ id: item.downloadId });
+  if (!download) {
+    failItem(item, 'Chrome download record is missing.');
+  } else if (download.state === 'complete') {
+    await rememberDownload(item, download);
+    item.status = 'complete';
+    addLog('Downloaded: ' + item.name);
+  } else if (download.state === 'interrupted') {
+    if (state.cancelled && download.error === 'USER_CANCELED') item.status = 'cancelled';
+    else if (!state.cancelled && item.href && (item.downloadRetries || 0) < 2 &&
+        /^(NETWORK_FAILED|NETWORK_TIMEOUT|NETWORK_DISCONNECTED|NETWORK_SERVER_DOWN)$/.test(download.error)) {
+      item.downloadRetries = (item.downloadRetries || 0) + 1;
+      item.status = 'queued';
+      delete item.downloadId;
+      addLog('Retrying ' + item.name + ' after Chrome reported ' + download.error + '.');
+    } else {
+      failItem(item, download.error || 'Chrome interrupted the download.');
+    }
+  } else {
+    item.bytesReceived = download.bytesReceived;
+    item.totalBytes = download.totalBytes;
+    if (state.cancelled) await chrome.downloads.cancel(item.downloadId).catch(() => {});
+  }
+}
+
+function hasResolvedPeer(item, statuses) {
+  return state.items.some(other => other !== item && statuses.includes(other.status) &&
+    item.resolvedIdentity && (other.resolvedIdentity || other.identity) === item.resolvedIdentity);
+}
+
+async function skipResolvedDuplicate(item) {
+  // Keep the alias on the completed entry so the next preview can skip it without fetching.
   const history = await getDownloadHistory();
-  return history[fileKey(courseName, file)] || null;
+  const record = Object.values(history).find(entry =>
+    entry.courseKey === state.courseKey && entry.identities?.includes(item.resolvedIdentity));
+  if (record && !record.identities.includes(item.identity)) {
+    record.identities.push(item.identity);
+    await saveDownloadHistory(history);
+    knownIdentities?.add(item.identity);
+  }
+  item.status = 'duplicate';
+  item.reason = 'Duplicate after redirect';
+  addLog('Skipped duplicate: ' + item.name);
 }
 
-// ---------- Message handling ----------
+function serviceJob(publish = false) {
+  return withJobLock(async () => {
+    await loadJob();
+    if (state.status !== 'downloading') return publicState();
+
+    for (const item of state.items) {
+      if (item.status === 'submitting') await reconcileSubmission(item);
+      if (item.status === 'in_progress') await reconcileDownload(item);
+      if (state.cancelled && ['queued', 'preparing', 'waiting'].includes(item.status)) item.status = 'cancelled';
+    }
+    for (const item of state.items.filter(file => file.status === 'waiting')) {
+      if (hasResolvedPeer(item, ['complete'])) await skipResolvedDuplicate(item);
+      else if (!hasResolvedPeer(item, ['submitting', 'in_progress'])) item.status = 'queued';
+    }
+
+    const active = state.items.filter(item => ['preparing', 'in_progress', 'submitting'].includes(item.status)).length;
+    const next = state.items.filter(item => item.status === 'queued').slice(0, Math.max(0, DOWNLOAD_SLOTS - active));
+    if (!active && !next.length) {
+      state.status = state.cancelled ? 'cancelled' : 'complete';
+      await chrome.alarms.clear(DOWNLOAD_ALARM);
+    }
+    for (const item of next) item.status = 'preparing';
+    recountJob();
+    await persistJob();
+    if (publish) broadcastProgress();
+    for (const item of next) void prepareItem(item, state.jobId, state.basePath);
+    return publicState();
+  });
+}
+
+async function prepareItem(item, jobId, basePath) {
+  let prepared;
+  let failure;
+  try {
+    if (!item.href) {
+      failure = 'This temporary link expired when the worker stopped. Scan again to refresh it.';
+    } else {
+      prepared = await prepareWithRetry(item, basePath, 3, () => state.cancelled || state.jobId !== jobId);
+    }
+  } catch (error) {
+    failure = item.type === 'pageFile' || /^HTTP \d+$/.test(error.message) ||
+      error.message === 'Moodle returned HTML instead of a file.'
+      ? error.message : 'Could not fetch or prepare this file.';
+  }
+  try {
+    await withJobLock(async () => {
+      if (state.jobId !== jobId || item.status !== 'preparing') return;
+      if (state.cancelled) {
+        item.status = 'cancelled';
+      } else if (!prepared) {
+        failItem(item, failure || 'File preparation stopped.');
+      } else {
+        item.resolvedIdentity = await resourceIdentity(prepared.responseUrl || item.href, item.resourceId);
+        if (!knownIdentities) {
+          knownIdentities = await historyIdentities(await getDownloadHistory(), state.courseName, state.courseKey);
+        }
+        if (knownIdentities.has(item.resolvedIdentity) || hasResolvedPeer(item, ['complete'])) {
+          await skipResolvedDuplicate(item);
+        } else if (hasResolvedPeer(item, ['in_progress', 'submitting'])) {
+          item.status = 'waiting';
+        } else {
+          item.status = 'submitting';
+          item.fullPath = prepared.fullPath;
+          item.submissionHash = await fingerprint(prepared.downloadUrl);
+          item.startedAt = Date.now();
+          await persistJob();
+          try {
+            item.downloadId = await submitDownload(prepared.downloadUrl, prepared.fullPath);
+            item.status = 'in_progress';
+          } catch (error) {
+            failItem(item, error.message);
+          }
+        }
+      }
+      await checkpoint();
+    });
+  } catch (error) {
+    reportJobFailure(error);
+  } finally {
+    wakeJob();
+  }
+}
+
+function reportJobFailure() {
+  console.warn('KEATS Downloader could not update its job. It will retry reconciliation on the next status check.');
+}
+
+function wakeJob() {
+  void serviceJob(true).catch(reportJobFailure);
+}
+
+// Top-level listeners wake a dormant Manifest V3 worker.
+chrome.downloads.onChanged.addListener(delta => {
+  if (delta.state) wakeJob();
+});
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === DOWNLOAD_ALARM) wakeJob();
+});
+
+async function historySummary() {
+  const history = await getDownloadHistory();
+  const courses = Object.create(null);
+  for (const entry of Object.values(history)) {
+    const course = entry.course || 'Unknown';
+    if (!courses[course]) courses[course] = { count: 0, lastDownload: 0 };
+    courses[course].count++;
+    courses[course].lastDownload = Math.max(courses[course].lastDownload, entry.date || 0);
+  }
+  return { total: Object.keys(history).length, courses };
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  let reply;
   switch (msg.type) {
-    case 'START_DOWNLOAD':
-      startDownload(msg.tabId, msg.courseInfo, msg.options).catch(err => {
-        state.status = 'error';
-        addLog(`Error: ${err.message}`);
-        broadcastProgress();
-      });
-      sendResponse({ ok: true });
-      break;
-    case 'GET_STATUS':
-      sendResponse({ ...state });
-      break;
-    case 'CANCEL':
-      if (state.status === 'scanning' || state.status === 'downloading') {
-        state.cancelled = true;
-        state.status = 'cancelled';
-        chrome.downloads.setUiOptions({ enabled: true }).catch(() => {});
-        broadcastProgress();
-      } else {
-        // Reset state when called from "Done"
-        state = { status: 'idle', courseName: '', totalFiles: 0, downloadedFiles: 0,
-          failedFiles: 0, scannedSections: 0, totalSections: 0, currentFile: '', log: [], errors: [], sections: [], cancelled: false };
-      }
-      sendResponse({ ok: true });
-      break;
-    case 'GET_HISTORY':
-      getDownloadHistory().then(h => {
-        // Group by course
-        const courses = {};
-        for (const [key, entry] of Object.entries(h)) {
-          const course = entry.course || 'Unknown';
-          if (!courses[course]) courses[course] = { count: 0, lastDownload: 0 };
-          courses[course].count++;
-          if (entry.date > courses[course].lastDownload) courses[course].lastDownload = entry.date;
-        }
-        sendResponse({ total: Object.keys(h).length, courses });
-      });
-      return true; // async response
+    case 'SCAN_COURSE': reply = beginScan(msg.tabId, msg.courseInfo, msg.options); break;
+    case 'CONFIRM_DOWNLOAD': reply = confirmDownload(msg.jobId); break;
+    case 'GET_STATUS': reply = serviceJob(); break;
+    case 'CANCEL': reply = cancelJob(msg.jobId); break;
+    case 'GET_HISTORY': reply = historySummary(); break;
     case 'CLEAR_HISTORY':
-      if (msg.course) {
-        // Clear history for a specific course
-        getDownloadHistory().then(h => {
-          for (const [key, entry] of Object.entries(h)) {
-            if (entry.course === msg.course) delete h[key];
-          }
-          saveDownloadHistory(h).then(() => sendResponse({ ok: true }));
-        });
-      } else {
-        saveDownloadHistory({}).then(() => sendResponse({ ok: true }));
-      }
-      return true; // async response
-    case 'CHECK_NEW_FILES':
-      checkForNewFiles(msg.tabId).then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: false }));
-      return true;
+      reply = withJobLock(async () => {
+        const history = msg.course ? await getDownloadHistory() : {};
+        if (msg.course) for (const [key, entry] of Object.entries(history)) {
+          if (entry.course === msg.course) delete history[key];
+        }
+        await saveDownloadHistory(history);
+        knownIdentities = undefined;
+        return { ok: true };
+      });
+      break;
+    case 'CHECK_NEW_FILES': reply = checkForNewFiles(msg.tabId).then(() => ({ ok: true })); break;
+    default: return false;
   }
-  return false;
+  reply.then(sendResponse, () => sendResponse({ ok: false, error: 'The extension could not update the job.' }));
+  return true;
 });
+
 
 // ---------- Fetch file as blob and resolve filename ----------
 
@@ -236,7 +610,7 @@ async function fetchFileBlob(url) {
   }
 
   const blob = await resp.blob();
-  return { blob, filename };
+  return { blob, filename, responseUrl: resp.url };
 }
 
 async function blobToDataUrl(blob) {
@@ -253,34 +627,14 @@ async function blobToDataUrl(blob) {
 
 // ---------- Core workflow ----------
 
-async function startDownload(_tabId, courseInfo, options = {}) {
-  const sectionCount = courseInfo?.sections?.length || 0;
-  const cName = courseInfo?.courseName || 'Unknown';
-
-  state = {
-    status: 'scanning',
-    courseName: cName,
-    totalFiles: 0,
-    downloadedFiles: 0,
-    failedFiles: 0,
-    scannedSections: 0,
-    totalSections: sectionCount,
-    currentFile: '',
-    log: [],
-    errors: [],
-    sections: [],
-    cancelled: false,
-  };
-
+async function scanCourse(tabId, courseInfo, options) {
+  const courseName = state.courseName;
+  const sectionCount = courseInfo.sections.length;
   const doMaterials = options.materials !== false;
   const doVideos = options.videos === true;
   const doCaptures = options.captures === true;
   const doFolders = options.folders !== false;
   const doOptional = options.optional === true;
-
-  const courseName = sanitize(cName).substring(0, 80);
-  const downloadFolder = sanitize(options.downloadPath || 'KEATS Downloads');
-  const basePath = `${downloadFolder}/${courseName}/`;
 
   addLog(`Course: ${courseName}`);
   addLog(`Sections: ${sectionCount}`);
@@ -290,12 +644,15 @@ async function startDownload(_tabId, courseInfo, options = {}) {
 
   const tempTab = await chrome.tabs.create({ url: 'about:blank', active: false });
   const tempTabId = tempTab.id;
+  state.scanTabId = tempTabId;
 
   try {
+    await persistJob();
     // ==================== Phase 1: Scan sections for files ====================
     const allFiles = [];
+    const pageScan = { tabId, origin: parsePageUrl(courseInfo.courseUrl)?.origin, visited: new Set() };
 
-    if (doMaterials) {
+    if (doMaterials || doVideos) {
       // Check if all sections are inline (topics/topcoll format)
       const allInline = courseInfo.sections.every(s => s.inline && s.sectionId);
 
@@ -323,7 +680,7 @@ async function startDownload(_tabId, courseInfo, options = {}) {
 
         addLog(`Scraping content...`);
         broadcastProgress();
-        const batchResults = await executeScrape(tempTabId, scrapeAllInlineSections, sectionIds, doOptional);
+        const batchResults = await executeScrape(tempTabId, scrapeAllInlineSections, sectionIds, doOptional, doVideos);
 
         for (let i = 0; i < courseInfo.sections.length; i++) {
           if (state.cancelled) break;
@@ -335,7 +692,10 @@ async function startDownload(_tabId, courseInfo, options = {}) {
           const expandedFiles = [];
           for (const file of files) {
             if (state.cancelled) break;
-            if (file.type === 'folder' && doFolders) {
+            if (!doMaterials && file.type !== 'kaltura') continue;
+            if (file.type === 'page') {
+              await expandMoodlePage(file, pageScan, expandedFiles);
+            } else if (file.type === 'folder' && doFolders) {
               addLog(`  Expanding folder: ${file.name}`);
               await navigateTab(tempTabId, file.href);
               await sleep(800);
@@ -374,6 +734,7 @@ async function startDownload(_tabId, courseInfo, options = {}) {
                 }
                 file.href = videoInfo.downloadUrl;
                 file.type = 'kalturaDownload';
+                file.resourceId = ['kaltura', videoInfo.partnerId, videoInfo.entryId].join(':');
                 expandedFiles.push(file);
               } else {
                 addLog(`  Could not resolve video: ${file.name}`);
@@ -414,7 +775,7 @@ async function startDownload(_tabId, courseInfo, options = {}) {
               await navigateTab(tempTabId, coursePageUrl);
               await sleep(1500);
             }
-            files = await executeScrape(tempTabId, scrapeInlineSection, section.sectionId, doOptional);
+            files = await executeScrape(tempTabId, scrapeInlineSection, section.sectionId, doOptional, doVideos);
           } else {
             await navigateTab(tempTabId, section.href);
             await sleep(1000);
@@ -424,7 +785,10 @@ async function startDownload(_tabId, courseInfo, options = {}) {
           const expandedFiles = [];
           for (const file of files) {
             if (state.cancelled) break;
-            if (file.type === 'folder' && doFolders) {
+            if (!doMaterials && file.type !== 'kaltura') continue;
+            if (file.type === 'page') {
+              await expandMoodlePage(file, pageScan, expandedFiles);
+            } else if (file.type === 'folder' && doFolders) {
               addLog(`  Expanding folder: ${file.name}`);
               await navigateTab(tempTabId, file.href);
               await sleep(800);
@@ -463,6 +827,7 @@ async function startDownload(_tabId, courseInfo, options = {}) {
                 }
                 file.href = videoInfo.downloadUrl;
                 file.type = 'kalturaDownload';
+                file.resourceId = ['kaltura', videoInfo.partnerId, videoInfo.entryId].join(':');
                 expandedFiles.push(file);
               } else {
                 addLog(`  Could not resolve video: ${file.name}`);
@@ -569,6 +934,7 @@ async function startDownload(_tabId, courseInfo, options = {}) {
                 sectionName: 'Lecture Recordings',
                 courseName: courseName,
                 type: 'echo360',
+                resourceId: ['echo360', institutionId, recording.mediaId].join(':'),
               });
             } else {
               addLog(`    Could not get video URL`);
@@ -578,90 +944,221 @@ async function startDownload(_tabId, courseInfo, options = {}) {
       }
     }
 
-    // Remove temp tab
-    try { await chrome.tabs.remove(tempTabId); } catch (e) {}
+    return allFiles.filter(file => ['resource', 'folderFile', 'pageFile', 'echo360', 'kalturaDownload'].includes(file.type));
+  } finally {
+    await chrome.tabs.remove(tempTabId).catch(() => {});
+    delete state.scanTabId;
+  }
+}
 
-    // ==================== Phase 3: Download files ====================
-    const downloadable = allFiles.filter(f =>
-      f.type === 'resource' || f.type === 'folderFile' || f.type === 'echo360' || f.type === 'kalturaDownload'
-    );
+// ==================== Moodle Page resources ====================
 
-    // Filter out already-downloaded files
-    let skippedFiles = 0;
-    const toDownload = [];
-    for (const file of downloadable) {
-      const existing = await isAlreadyDownloaded(courseName, file);
-      if (existing) {
-        skippedFiles++;
-      } else {
-        toDownload.push(file);
-      }
+const MOODLE_PAGE = /\/mod\/page\/view\.php$/;
+const MOODLE_RESOURCE = /\/mod\/resource\/view\.php$/;
+const MOODLE_FILE = /\/pluginfile\.php(?:\/|$)/;
+const PAGE_FILE_EXTENSION = /\.(?:pdf|pptx?|docx?|xlsx?|od[pts]|zip|csv|txt|rtf|epub|ipynb|mp[34]|png|jpe?g|webp)$/i;
+const MAX_PAGE_DEPTH = 3;
+const MAX_PAGE_VISITS = 100;
+
+function pageLinkKey(href, forHistory = false) {
+  const url = parsePageUrl(href);
+  if (!url || url.username || url.password) return null;
+  url.hash = '';
+  // Moodle serves the same file with or without these display parameters.
+  if (MOODLE_FILE.test(url.pathname)) {
+    if (url.pathname.endsWith('/pluginfile.php') && url.searchParams.get('file')?.startsWith('/')) {
+      url.pathname += url.searchParams.get('file').split('/').map(encodeURIComponent).join('/');
+      url.searchParams.delete('file');
     }
+    url.searchParams.delete('forcedownload');
+  }
+  url.pathname = url.pathname.split('/').map(segment => {
+    try { return encodeURIComponent(decodeURIComponent(segment)); } catch { return segment; }
+  }).join('/');
+  if (MOODLE_PAGE.test(url.pathname) || MOODLE_RESOURCE.test(url.pathname)) {
+    url.searchParams.delete('redirect');
+    url.searchParams.delete('forceview');
+    url.searchParams.delete('inpopup');
+  }
+  // Skip history for links with opaque query parameters, which may contain signed access data.
+  if (forHistory && [...url.searchParams].some(([key, value]) =>
+    !MOODLE_RESOURCE.test(url.pathname) || key !== 'id' || !/^\d+$/.test(value))) return null;
+  url.searchParams.sort();
+  return url.href;
+}
 
-    if (skippedFiles > 0) {
-      addLog(`\nSkipped ${skippedFiles} previously downloaded files`);
-    }
+function parsePageUrl(href, base) {
+  try { return new URL(href, base); } catch { return null; }
+}
 
-    state.totalFiles = toDownload.length;
-    state.status = 'downloading';
-    addLog(`Downloading ${toDownload.length} new files...`);
-    broadcastProgress();
-
+async function expandMoodlePage(root, scan, files) {
+  const queue = [{ ...root, depth: 1 }];
+  for (const page of queue) {
     if (state.cancelled) return;
+    const url = parsePageUrl(page.href);
+    if (!url || url.protocol !== 'https:' || url.origin !== scan.origin || url.username || url.password ||
+        !MOODLE_PAGE.test(url.pathname)) continue;
 
-    // Hide Chrome's download bar/bubble during bulk download
-    try { await chrome.downloads.setUiOptions({ enabled: false }); } catch (e) {}
-
-    const CONCURRENCY = 3;
-    let idx = 0;
-
-    async function worker() {
-      while (idx < toDownload.length && !state.cancelled) {
-        const file = toDownload[idx++];
-        state.currentFile = file.name;
-        broadcastProgress();
-
-        try {
-          await downloadWithRetry(file, basePath, 3);
-          state.downloadedFiles++;
-          await markDownloaded(courseName, file, basePath);
-          addLog(`Downloaded: ${file.name}`);
-        } catch (err) {
-          state.failedFiles++;
-          state.errors.push({ name: file.name, error: err.message || String(err) });
-          addLog(`Failed: ${file.name} - ${err.message || err}`);
-        }
-        broadcastProgress();
-      }
+    const id = ['p', 'id'].find(param => /^\d+$/.test(url.searchParams.get(param) || ''));
+    if (!id) continue;
+    const key = url.pathname + '?' + id + '=' + url.searchParams.get(id);
+    if (scan.visited.has(key)) continue;
+    if (scan.visited.size >= MAX_PAGE_VISITS) {
+      if (!scan.limitLogged) addLog('Skipped further Moodle Pages: course visit limit reached.');
+      scan.limitLogged = true;
+      return;
     }
+    scan.visited.add(key);
 
-    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
-
-    // Re-enable Chrome's download UI
-    try { await chrome.downloads.setUiOptions({ enabled: true }); } catch (e) {}
-
-    state.status = state.cancelled ? 'cancelled' : 'complete';
-    state.currentFile = '';
-    addLog(`\nDone! ${state.downloadedFiles} downloaded, ${state.failedFiles} failed.${skippedFiles > 0 ? ` ${skippedFiles} skipped (already downloaded).` : ''}`);
+    const name = page.name || 'Moodle Page';
+    addLog('  Scanning page: ' + name);
     broadcastProgress();
-
-    // Clear new-files badges on all tabs
     try {
-      const tabs = await chrome.tabs.query({});
-      for (const t of tabs) {
-        chrome.action.setBadgeText({ text: '', tabId: t.id });
+      const result = await requestPageContent(scan.tabId, scan.origin, url.href, 'page');
+      if (state.cancelled) return;
+      let found = 0;
+      for (const link of result.links) {
+        const target = parsePageUrl(link.href, result.url);
+        if (!target || target.origin !== scan.origin || target.username || target.password) continue;
+        if (MOODLE_PAGE.test(target.pathname)) {
+          if (page.depth < MAX_PAGE_DEPTH) {
+            queue.push({ href: target.href, name: link.name, depth: page.depth + 1 });
+            found++;
+          } else {
+            addLog('  Skipped child page from ' + name + ': depth limit reached.');
+          }
+          continue;
+        }
+        if (!MOODLE_RESOURCE.test(target.pathname) && !MOODLE_FILE.test(target.pathname) &&
+            !PAGE_FILE_EXTENSION.test(target.pathname) && link.download === null) continue;
+        found++;
+        target.hash = '';
+        files.push({
+          name: link.download || link.name || 'Download',
+          href: target.href,
+          type: 'pageFile',
+          category: root.category,
+          tabId: scan.tabId,
+          origin: scan.origin,
+        });
       }
-    } catch (e) {}
+      if (!found) addLog('  No downloadable files found on page: ' + name);
+    } catch (err) {
+      state.errors.push({ name, error: err.message });
+      addLog('Failed: ' + name + ' - ' + err.message);
+    }
+  }
+}
 
-  } catch (err) {
-    state.status = 'error';
-    addLog(`Error: ${err.message}`);
-    broadcastProgress();
-    try { await chrome.tabs.remove(tempTabId); } catch (e) {}
-    try { await chrome.downloads.setUiOptions({ enabled: true }); } catch (e) {}
+async function requestPageContent(tabId, origin, url, kind, expectedName = '') {
+  let result;
+  try {
+    result = await executeScrape(tabId, readPageContent, origin, url, kind, expectedName);
+  } catch {
+    throw new Error('Could not read KEATS in the course tab. Keep the signed-in course tab open.');
+  }
+  if (result.error) throw new Error(result.error);
+  if (!result.url) throw new Error('Could not read a response from the course tab.');
+  return result;
+}
+
+// Injected into the original course tab so cookies are sent by the browser's
+// same-origin fetch. A cross-origin redirect fails before requesting its target.
+async function readPageContent(origin, url, kind, expectedName) {
+  if (location.origin !== origin || !origin.startsWith('https://')) {
+    return { error: 'The signed-in course tab is no longer on KEATS.' };
   }
 
+  try {
+    const response = await fetch(url, {
+      mode: 'same-origin',
+      credentials: 'same-origin',
+      signal: AbortSignal.timeout(20000),
+    });
+    const finalUrl = new URL(response.url);
+    if (/\/(?:login|auth)(?:\/|$)/i.test(finalUrl.pathname) || response.status === 401) {
+      return { error: 'KEATS session expired or sign-in is required.' };
+    }
+    if (!response.ok) return { error: 'HTTP ' + response.status };
+    const type = (response.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
+
+    if (kind === 'page') {
+      // Template contents are inert, including scripts and external embeds.
+      const template = document.createElement('template');
+      template.innerHTML = await response.text();
+      const dom = template.content;
+      if (dom.querySelector('form#login, form[action*="/login/"], input[type="password"]') &&
+          !dom.querySelector('#region-main .generalbox.center.clearfix')) {
+        return { error: 'KEATS session expired or sign-in is required.' };
+      }
+      if (dom.querySelector('#region-main .errorcode, #region-main .alert-danger')) {
+        return { error: 'Moodle returned an error page.' };
+      }
+      if (!/\/mod\/page\/view\.php$/.test(finalUrl.pathname)) {
+        return { error: 'Moodle redirected to a page outside the expected Page activity.' };
+      }
+      const main = dom.querySelector('#region-main, main, [role="main"]');
+      if (!main) return { error: 'Moodle Page content region was missing.' };
+      const content = main.querySelector('.generalbox.center.clearfix') || main;
+      const links = Array.from(content.querySelectorAll('a[href]'))
+        .filter(a => !a.closest('nav, [role="navigation"], .activity-navigation, .breadcrumb, #courseindex, #page-footer'))
+        .map(a => ({
+          href: a.getAttribute('href'),
+          name: a.textContent.trim(),
+          download: a.getAttribute('download'),
+        }));
+      return { url: finalUrl.href, links };
+    }
+
+    const blob = await response.blob();
+    const header = await blob.slice(0, 1024).text();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const isPdf = /^%PDF-\d\.\d/.test(header);
+    const pdfExpected = type === 'application/pdf' || /\.pdf(?:$|[?"&#;])/i.test(
+      [url, finalUrl.href, disposition, expectedName].join(';')
+    );
+    if (type === 'text/html' || type === 'application/xhtml+xml' ||
+        /^\s*(?:<!--|<(?:!doctype\s+html|html|head|body|title|form|div|script|meta|p|h[1-6])\b)/i.test(header)) {
+      const login = /(?:id=["']login|\/login\/index\.php|type=["']password)/i.test(header);
+      return { error: login ? 'KEATS session expired or sign-in is required.' : 'Moodle returned HTML instead of a file.' };
+    }
+    if (!blob.size || (pdfExpected && !isPdf)) {
+      return { error: blob.size ? 'The response has no valid PDF header.' : 'The response was empty.' };
+    }
+
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(isPdf && type !== 'application/pdf' ? new Blob([blob], { type: 'application/pdf' }) : blob);
+    });
+    return { url: finalUrl.href, disposition, isPdf, dataUrl };
+  } catch (err) {
+    return { error: err.name === 'TimeoutError'
+      ? 'The KEATS request timed out.'
+      : 'The KEATS request failed or was redirected to an external sign-in page.' };
+  }
 }
+
+function pageFileName(file, result) {
+  const decode = value => {
+    try { return decodeURIComponent(value); } catch { return value; }
+  };
+  const fromUrl = href => {
+    const url = new URL(href);
+    const path = MOODLE_FILE.test(url.pathname) && url.searchParams.get('file') || url.pathname;
+    const basename = decode(path.split('/').pop());
+    return /\.[a-z0-9]{1,12}$/i.test(basename) && !/\.php$/i.test(basename) ? basename : '';
+  };
+  const encoded = result.disposition.match(/(?:^|;)\s*filename\*=UTF-8'[^']*'([^;]+)/i);
+  const plain = result.disposition.match(/(?:^|;)\s*filename\s*=\s*(?:"([^"]+)"|([^;]+))/i);
+  const candidate = (encoded && decode(encoded[1])) || plain?.[1] || plain?.[2] ||
+    fromUrl(result.url) || fromUrl(file.href) || file.name;
+  let name = sanitize(candidate.replace(/[\x00-\x1f\x7f]/g, ' ')) || 'Download';
+  if (result.isPdf && !/\.pdf$/i.test(name)) name += '.pdf';
+  return name;
+}
+
 
 // ==================== Scraping functions (injected into tabs) ====================
 
@@ -709,6 +1206,11 @@ function scrapeSectionPage(includeOptional) {
     // Skip optional resources unless user opted in
     if (isOptional && !includeOptional) continue;
 
+    const pageLink = el.querySelector('a[href*="/mod/page/view.php"]');
+    if (pageLink) {
+      results.push({ name: pageLink.textContent.trim(), href: pageLink.href, category: currentCategory, type: 'page' });
+    }
+
     if (el.classList.contains('modtype_resource')) {
       const link = el.querySelector('a[href*="/mod/resource/"]');
       if (!link) continue;
@@ -739,7 +1241,7 @@ function scrapeSectionPage(includeOptional) {
   return results;
 }
 
-function scrapeInlineSection(sectionId, includeOptional) {
+function scrapeInlineSection(sectionId, includeOptional, includeVideos = false) {
   // Find the section — try multiple selectors for different Moodle formats
   let section = document.querySelector(
     `.section.course-section[data-id="${sectionId}"], ` +
@@ -791,6 +1293,17 @@ function scrapeInlineSection(sectionId, includeOptional) {
 
     if (isOptional && !includeOptional) continue;
 
+    if (includeVideos && (el.classList.contains('modtype_kalvidres') || el.classList.contains('modtype_kalvidpres'))) {
+      const link = el.querySelector('a[href*="/mod/kalvid"]');
+      const name = link?.textContent.trim().replace(/\s*Kaltura Video (Resource|Presentation)\s*/gi, '').trim();
+      if (name) results.push({ name, href: link.href, category: currentCategory, type: 'kaltura' });
+    }
+
+    const pageLink = el.querySelector('a[href*="/mod/page/view.php"]');
+    if (pageLink) {
+      results.push({ name: pageLink.textContent.trim(), href: pageLink.href, category: currentCategory, type: 'page' });
+    }
+
     if (el.classList.contains('modtype_resource')) {
       const link = el.querySelector('a[href*="/mod/resource/"]');
       if (!link) continue;
@@ -827,7 +1340,7 @@ function expandCollapsedSections(sectionIds) {
   return expanded;
 }
 
-function scrapeAllInlineSections(sectionIds, includeOptional) {
+function scrapeAllInlineSections(sectionIds, includeOptional, includeVideos = false) {
   const resultMap = {};
 
   for (const sectionId of sectionIds) {
@@ -875,6 +1388,17 @@ function scrapeAllInlineSections(sectionIds, includeOptional) {
       }
 
       if (isOptional && !includeOptional) continue;
+
+      if (includeVideos && (el.classList.contains('modtype_kalvidres') || el.classList.contains('modtype_kalvidpres'))) {
+        const link = el.querySelector('a[href*="/mod/kalvid"]');
+        const name = link?.textContent.trim().replace(/\s*Kaltura Video (Resource|Presentation)\s*/gi, '').trim();
+        if (name) results.push({ name, href: link.href, category: currentCategory, type: 'kaltura' });
+      }
+
+      const pageLink = el.querySelector('a[href*="/mod/page/view.php"]');
+      if (pageLink) {
+        results.push({ name: pageLink.textContent.trim(), href: pageLink.href, category: currentCategory, type: 'page' });
+      }
 
       if (el.classList.contains('modtype_resource')) {
         const link = el.querySelector('a[href*="/mod/resource/"]');
@@ -1123,15 +1647,15 @@ function scrapeEcho360Syllabus(sectionId) {
 
 // ==================== Download with retry ====================
 
-async function downloadWithRetry(file, basePath, maxRetries = 3) {
+async function prepareWithRetry(file, basePath, maxRetries = 3, isCancelled = () => false) {
   let lastError;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      await downloadSingleFile(file, basePath);
-      return;
+      if (isCancelled()) return null;
+      return await prepareDownload(file, basePath);
     } catch (err) {
       lastError = err;
-      if (attempt < maxRetries) {
+      if (attempt < maxRetries && !isCancelled()) {
         const delay = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
         addLog(`  Retry ${attempt}/${maxRetries - 1} for: ${file.name}`);
         await sleep(delay);
@@ -1143,7 +1667,7 @@ async function downloadWithRetry(file, basePath, maxRetries = 3) {
 
 // ==================== Download handler ====================
 
-async function downloadSingleFile(file, basePath) {
+async function prepareDownload(file, basePath) {
   // Build directory path
   let dirPath = basePath;
 
@@ -1162,13 +1686,16 @@ async function downloadSingleFile(file, basePath) {
   // Build download URL
   let url = file.href;
   if (file.type === 'resource') {
-    const sep = url.includes('?') ? '&' : '?';
-    url = url + sep + 'redirect=1';
+    const target = new URL(url);
+    target.hash = '';
+    target.searchParams.set('redirect', '1');
+    url = target.href;
   }
 
   // Determine filename and fetch content
   let filename;
   let downloadUrl;
+  let responseUrl;
 
   if (file.type === 'folderFile') {
     const urlPath = new URL(file.href).pathname;
@@ -1181,53 +1708,40 @@ async function downloadSingleFile(file, basePath) {
     // Video files: download directly from CDN (too large for data URL)
     downloadUrl = url;
     if (!filename) filename = sanitize(file.name) + '.mp4';
+  } else if (file.type === 'pageFile') {
+    const target = new URL(url);
+    if (MOODLE_RESOURCE.test(target.pathname)) target.searchParams.set('redirect', '1');
+    const result = await requestPageContent(file.tabId, file.origin, target.href, 'file', file.name);
+    filename = pageFileName(file, result);
+    downloadUrl = result.dataUrl;
+    responseUrl = result.url;
   } else {
     // Fetch file content and convert to data URL to bypass save dialog
     const fetched = await fetchFileBlob(url);
+    if (/^(text\/html|application\/xhtml\+xml)(?:;|$)/i.test(fetched.blob.type) &&
+        !/\.x?html?$/i.test(fetched.filename || '')) {
+      throw new Error('Moodle returned HTML instead of a file.');
+    }
     if (fetched.filename) filename = fetched.filename;
     if (!filename) filename = sanitize(file.name) || 'download';
     downloadUrl = await blobToDataUrl(fetched.blob);
+    responseUrl = fetched.responseUrl;
   }
 
-  const fullPath = dirPath + filename;
+  return { downloadUrl, fullPath: dirPath + filename, responseUrl };
+}
 
+function submitDownload(downloadUrl, fullPath) {
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
       { url: downloadUrl, filename: fullPath, saveAs: false, conflictAction: 'uniquify' },
-      (downloadId) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        if (downloadId === undefined) {
-          reject(new Error('Download failed to start'));
-          return;
-        }
-
-        const listener = (delta) => {
-          if (delta.id !== downloadId) return;
-          if (delta.state) {
-            if (delta.state.current === 'complete') {
-              chrome.downloads.onChanged.removeListener(listener);
-              resolve();
-            } else if (delta.state.current === 'interrupted') {
-              chrome.downloads.onChanged.removeListener(listener);
-              reject(new Error(delta.error?.current || 'Download interrupted'));
-            }
-          }
-        };
-
-        chrome.downloads.onChanged.addListener(listener);
-
-        setTimeout(() => {
-          chrome.downloads.onChanged.removeListener(listener);
-          reject(new Error('Download timeout'));
-        }, 120000);
+      downloadId => {
+        if (chrome.runtime.lastError || downloadId === undefined) reject(new Error('Chrome could not start this download.'));
+        else resolve(downloadId);
       }
     );
   });
 }
-
 // ==================== Execute scraping in a tab ====================
 
 async function executeScrape(tabId, func, ...args) {
@@ -1289,13 +1803,14 @@ function addLog(msg) {
 }
 
 function broadcastProgress() {
-  chrome.runtime.sendMessage({ type: 'PROGRESS_UPDATE', state: { ...state } }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'PROGRESS_UPDATE', state: publicState() }).catch(() => {});
 }
 
 // Expose internals for testing (no-op in Chrome extension context)
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    sanitize, addLog, sleep, downloadWithRetry, fileKey, blobToDataUrl, fetchFileBlob,
+    sanitize, addLog, sleep, prepareWithRetry, fileKey, blobToDataUrl, fetchFileBlob,
+    beginScan, confirmDownload, cancelJob, serviceJob, publicState,
     scrapeSectionPage, scrapeInlineSection, scrapeAllInlineSections, scrapeFolderPage,
     scrapeEcho360LTI, isMoodleCoursePage: undefined,
     get state() { return state; },

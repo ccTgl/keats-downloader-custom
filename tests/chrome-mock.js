@@ -1,15 +1,30 @@
 // Shared Chrome API mock for tests
 function createChromeMock() {
   const downloadListeners = [];
+  const items = new Map();
   let nextDownloadId = 1;
+  let autoComplete = true;
+  const updateDownload = (id, patch) => {
+    Object.assign(items.get(id), patch);
+    if (patch.state) for (const listener of [...downloadListeners]) {
+      listener({ id, state: { current: patch.state } });
+    }
+  };
+  const copy = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 
   return {
     runtime: {
+      id: 'fixture-extension',
       lastError: null,
       onMessage: { addListener: jest.fn() },
       onConnect: { addListener: jest.fn() },
       connect: jest.fn(() => ({ onDisconnect: { addListener: jest.fn() }, disconnect: jest.fn() })),
       sendMessage: jest.fn().mockResolvedValue(undefined),
+    },
+    alarms: {
+      create: jest.fn().mockResolvedValue(),
+      clear: jest.fn().mockResolvedValue(true),
+      onAlarm: { addListener: jest.fn() },
     },
     tabs: {
       create: jest.fn().mockResolvedValue({ id: 99 }),
@@ -28,14 +43,20 @@ function createChromeMock() {
     downloads: {
       download: jest.fn((opts, cb) => {
         const id = nextDownloadId++;
+        items.set(id, {
+          id, url: opts.url, filename: opts.filename, state: 'in_progress', bytesReceived: 0,
+          totalBytes: 100, startTime: new Date().toISOString(), byExtensionId: 'fixture-extension',
+        });
         cb(id);
-        // Auto-complete the download after a tick
-        setTimeout(() => {
-          for (const listener of downloadListeners) {
-            listener({ id, state: { current: 'complete' } });
-          }
-        }, 10);
+        if (autoComplete) setTimeout(() => updateDownload(id, { state: 'complete', bytesReceived: 100 }), 10);
       }),
+      search: jest.fn(async ({ id, startedAfter }) => copy([...items.values()].filter(item =>
+        (id === undefined || item.id === id) && (!startedAfter || item.startTime >= startedAfter)))),
+      cancel: jest.fn(async id => updateDownload(id, { state: 'interrupted', error: 'USER_CANCELED' })),
+      _setAutoComplete: value => { autoComplete = value; },
+      _update: updateDownload,
+      _clearListeners: () => { downloadListeners.length = 0; },
+      _clearItems: () => { items.clear(); },
       setUiOptions: jest.fn().mockResolvedValue(),
       onChanged: {
         addListener: jest.fn((fn) => downloadListeners.push(fn)),
@@ -56,17 +77,18 @@ function createChromeMock() {
       local: (() => {
         let store = {};
         return {
-          get: jest.fn((key) => Promise.resolve({ [key]: store[key] })),
-          set: jest.fn((obj) => { Object.assign(store, obj); return Promise.resolve(); }),
+          get: jest.fn((key) => Promise.resolve({ [key]: copy(store[key]) })),
+          set: jest.fn((obj) => { Object.assign(store, copy(obj)); return Promise.resolve(); }),
           _clear: () => { store = {}; },
         };
       })(),
       session: (() => {
         let store = {};
         return {
-          get: jest.fn((key) => Promise.resolve({ [key]: store[key] })),
-          set: jest.fn((obj) => { Object.assign(store, obj); return Promise.resolve(); }),
+          get: jest.fn((key) => Promise.resolve({ [key]: copy(store[key]) })),
+          set: jest.fn((obj) => { Object.assign(store, copy(obj)); return Promise.resolve(); }),
           remove: jest.fn(() => Promise.resolve()),
+          _clear: () => { store = {}; },
         };
       })(),
     },

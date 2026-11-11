@@ -1,33 +1,16 @@
-# Privacy Policy — KEATS Downloader
+# Privacy — KEATS Downloader Custom
 
-**Last updated:** March 2026
+The extension reads the Moodle course pages you select. Chrome uses your existing site session when the extension requests course resources. Requests go to the sites serving the course resources and, if selected, supported media providers. The extension has no telemetry service.
 
-## Data Collection
+## Browser storage
 
-KEATS Downloader does **not** collect, store, or transmit any personal data.
-
-## What the extension does
-
-- Reads course page content on KEATS (keats.kcl.ac.uk) and other Moodle sites to identify downloadable files
-- Downloads files directly to your local device using Chrome's built-in download manager
-- Stores your light/dark mode preference locally in your browser
-
-## What the extension does NOT do
-
-- No analytics or tracking
-- No data sent to external servers
-- No cookies created (it uses your existing KEATS login session)
-- No personal information collected or stored
-- No browsing history accessed
+- Chrome local extension storage holds settings and completed download history, including course and file names, resource identifiers, destination paths and completion times. Use **Downloaded Courses** to clear the extension's history.
+- Chrome session extension storage holds the current preview and queue while Chrome is running. Temporary signed links are kept in worker memory. Chrome's download manager maintains its own download history.
+- Your password is entered on the institution's sign-in page. Site cookies are managed by Chrome.
 
 ## Permissions
 
-- **downloads** — to save files to your device
-- **activeTab / scripting / tabs** — to read course page content and navigate to file URLs
-- **host permissions** — to access KEATS and video platform pages (Kaltura, Echo360)
-
-All processing happens locally in your browser. No data leaves your device.
-
-## Contact
-
-For questions, open an issue at [github.com/Saif-AD/keats-downloader](https://github.com/Saif-AD/keats-downloader/issues).
+- **downloads** and **downloads.ui** allow the extension to use Chrome's download manager.
+- **activeTab**, **scripting** and **tabs** allow the extension to read course pages and visit relevant resource pages.
+- **storage** keeps settings, download history and current task state. **alarms** lets the extension check an active queue after the service worker has gone idle.
+- HTTPS host access supports KEATS, other Moodle hosts and the optional media providers.
