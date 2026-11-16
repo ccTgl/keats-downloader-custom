@@ -12,6 +12,10 @@ KEATS Downloader Custom is a Chrome extension for saving course resources from K
 
 ## Install in Chrome
 
+[Install KEATS Downloader Custom from the Chrome Web Store](https://chromewebstore.google.com/detail/keats-downloader-custom/mejcihlgmnedepdjedahodbdjfnmhlik)
+
+### Manual installation
+
 1. Download `KEATS-Downloader-Custom-v1.5.0.zip` from this repository's **Releases** page and extract it.
 2. Open `chrome://extensions` and turn on **Developer mode**.
 3. Select **Load unpacked** and choose the extracted `extension` folder containing `manifest.json`.
